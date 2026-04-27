@@ -24,12 +24,11 @@
   <script type="text/babel" data-presets="react">
     const { useState, useEffect, useRef, useCallback } = React;
 
-    const APP_VERSION = '1.3.1';
+    const APP_VERSION = '1.3.2';
     const STORAGE_KEY = 'tasks-list-v1';
     const SETTINGS_KEY = 'app-settings-v1';
     const CALENDAR_CACHE_KEY = 'calendar-cache-v1';
 
-    // CORS proxy for fetching the calendar feed
     const CALENDAR_PROXY = 'https://todoapp.hugh-clarke.workers.dev/';
 
     const PRIORITIES = [
@@ -96,7 +95,7 @@
       return next.toISOString().slice(0, 10);
     }
 
-    function icsDate(d) {
+    function icsDateLocal(d) {
       const pad = (n) => String(n).padStart(2, '0');
       return d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate())
         + 'T' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
@@ -112,7 +111,7 @@
       if (task.dueDate) description += '\\n\\nDue: ' + task.dueDate;
       const lines = [
         'BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//To Do App//EN','CALSCALE:GREGORIAN','METHOD:PUBLISH',
-        'BEGIN:VEVENT','UID:' + uid,'DTSTAMP:' + icsDate(now),'DTSTART:' + icsDate(startDate),'DTEND:' + icsDate(end),
+        'BEGIN:VEVENT','UID:' + uid,'DTSTAMP:' + icsDateLocal(now),'DTSTART:' + icsDateLocal(startDate),'DTEND:' + icsDateLocal(end),
         'SUMMARY:' + escapeText(task.title),'DESCRIPTION:' + description,'STATUS:CONFIRMED','TRANSP:OPAQUE',
         'END:VEVENT','END:VCALENDAR'
       ];
@@ -150,20 +149,67 @@
       return (s || '').replace(/\\n/gi, '\n').replace(/\\,/g, ',').replace(/\\;/g, ';').replace(/\\\\/g, '\\');
     }
 
+    // Cache for VTIMEZONE definitions parsed out of the feed
+    let timezoneOffsetCache = {};
+
+    // Compute UTC offset (in minutes) for a given IANA timezone at a given UTC date.
+    // Uses Intl.DateTimeFormat which is supported in all modern browsers.
+    function getTimezoneOffsetMinutes(tzid, utcDate) {
+      try {
+        const formatter = new Intl.DateTimeFormat('en-US', {
+          timeZone: tzid,
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit',
+          hour12: false,
+        });
+        const parts = formatter.formatToParts(utcDate);
+        const get = (type) => parts.find(p => p.type === type)?.value;
+        const y = +get('year'), mo = +get('month'), d = +get('day');
+        const h = +get('hour'), mi = +get('minute'), s = +get('second');
+        // Hour reported as 24 means midnight next day in some implementations
+        const hour = h === 24 ? 0 : h;
+        const asUTC = Date.UTC(y, mo - 1, d, hour, mi, s);
+        return Math.round((asUTC - utcDate.getTime()) / 60000);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Parse a date-time value with possible TZID parameter.
+    // Returns a JS Date (in UTC internally, displayed in local time when formatted).
     function parseICSDateTime(value, params) {
+      // Date only: YYYYMMDD (all-day event)
       if (/^\d{8}$/.test(value)) {
         const y = +value.slice(0, 4), m = +value.slice(4, 6) - 1, d = +value.slice(6, 8);
         return new Date(y, m, d, 0, 0, 0);
       }
       const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/);
-      if (match) {
-        const [, y, m, d, hh, mm, ss, z] = match;
-        if (z === 'Z') {
-          return new Date(Date.UTC(+y, +m - 1, +d, +hh, +mm, +ss));
-        }
-        return new Date(+y, +m - 1, +d, +hh, +mm, +ss);
+      if (!match) return null;
+
+      const [, y, m, d, hh, mm, ss, z] = match;
+      const yN = +y, mN = +m - 1, dN = +d, hN = +hh, miN = +mm, sN = +ss;
+
+      // Has Z suffix: explicitly UTC
+      if (z === 'Z') {
+        return new Date(Date.UTC(yN, mN, dN, hN, miN, sN));
       }
-      return null;
+
+      // Has TZID: interpret the time as being in that timezone
+      if (params && params.TZID) {
+        const tzid = params.TZID;
+        // First, get a rough UTC timestamp by treating values as if they were UTC
+        const naiveUTC = Date.UTC(yN, mN, dN, hN, miN, sN);
+        // Find offset of the target timezone at that approximate moment
+        const offsetMinutes = getTimezoneOffsetMinutes(tzid, new Date(naiveUTC));
+        if (offsetMinutes !== null) {
+          // Subtract the offset to get the actual UTC time
+          return new Date(naiveUTC - offsetMinutes * 60000);
+        }
+        // Fall through to local interpretation if timezone unknown
+      }
+
+      // No timezone info: treat as floating local time
+      return new Date(yN, mN, dN, hN, miN, sN);
     }
 
     function parseICSFeed(text) {
@@ -226,7 +272,6 @@
       return trimmed;
     }
 
-    // Build the proxy URL: takes the user's calendar feed URL and wraps it with the proxy
     function buildProxiedUrl(feedUrl) {
       const normalised = normaliseFeedUrl(feedUrl);
       return CALENDAR_PROXY + '?url=' + encodeURIComponent(normalised);
@@ -337,12 +382,8 @@
 
       if (!visible) {
         return (
-          <button
-            onClick={onToggleVisible}
-            className="w-full mb-4 px-3 py-2 text-xs text-slate-500 bg-white/40 border border-slate-200 rounded-lg hover:bg-white/60 hover:text-slate-700 transition-all flex items-center justify-center gap-1.5"
-          >
-            <CalendarIcon className="w-3.5 h-3.5" />
-            Show today's calendar
+          <button onClick={onToggleVisible} className="w-full mb-4 px-3 py-2 text-xs text-slate-500 bg-white/40 border border-slate-200 rounded-lg hover:bg-white/60 hover:text-slate-700 transition-all flex items-center justify-center gap-1.5">
+            <CalendarIcon className="w-3.5 h-3.5" />Show today's calendar
           </button>
         );
       }
@@ -351,25 +392,15 @@
         <div className="mb-4 bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
           <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 bg-gradient-to-r from-sky-50 to-blue-50">
             <div className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-              <CalendarIcon className="w-4 h-4 text-sky-600" />
-              Today's calendar
-              {todaysEvents.length > 0 && (
-                <span className="text-xs font-normal text-slate-500">({todaysEvents.length} {todaysEvents.length === 1 ? 'event' : 'events'})</span>
-              )}
+              <CalendarIcon className="w-4 h-4 text-sky-600" />Today's calendar
+              {todaysEvents.length > 0 && <span className="text-xs font-normal text-slate-500">({todaysEvents.length} {todaysEvents.length === 1 ? 'event' : 'events'})</span>}
             </div>
             <div className="flex items-center gap-1">
-              {feedUrl && (
-                <button onClick={fetchFeed} disabled={loading} title="Refresh" className="p-1 text-slate-400 hover:text-slate-700 transition-colors disabled:opacity-50">
-                  <RefreshIcon className={'w-3.5 h-3.5 ' + (loading ? 'animate-spin' : '')} />
-                </button>
-              )}
-              <button onClick={onOpenSettings} title="Calendar settings" className="p-1 text-slate-400 hover:text-slate-700 transition-colors">
-                <SettingsIcon className="w-3.5 h-3.5" />
-              </button>
+              {feedUrl && <button onClick={fetchFeed} disabled={loading} title="Refresh" className="p-1 text-slate-400 hover:text-slate-700 transition-colors disabled:opacity-50"><RefreshIcon className={'w-3.5 h-3.5 ' + (loading ? 'animate-spin' : '')} /></button>}
+              <button onClick={onOpenSettings} title="Calendar settings" className="p-1 text-slate-400 hover:text-slate-700 transition-colors"><SettingsIcon className="w-3.5 h-3.5" /></button>
               <button onClick={onToggleVisible} title="Hide" className="p-1 text-slate-400 hover:text-slate-700 transition-colors text-sm leading-none">×</button>
             </div>
           </div>
-
           <div className="p-3">
             {!feedUrl ? (
               <div className="text-center py-4">
@@ -415,9 +446,7 @@
                 )}
               </div>
             )}
-            {lastFetched && !error && (
-              <div className="text-[10px] text-slate-400 mt-2 text-right">Updated {new Date(lastFetched).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</div>
-            )}
+            {lastFetched && !error && <div className="text-[10px] text-slate-400 mt-2 text-right">Updated {new Date(lastFetched).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</div>}
           </div>
         </div>
       );
@@ -425,12 +454,7 @@
 
     function SettingsModal({ settings, onSave, onClose }) {
       const [feedUrl, setFeedUrl] = useState(settings.calendarFeedUrl || '');
-
-      const handleSave = () => {
-        onSave({ ...settings, calendarFeedUrl: feedUrl.trim() });
-        onClose();
-      };
-
+      const handleSave = () => { onSave({ ...settings, calendarFeedUrl: feedUrl.trim() }); onClose(); };
       return (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={onClose}>
           <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-5" onClick={(e) => e.stopPropagation()}>
@@ -452,10 +476,10 @@
                 <li>Under "Publish a calendar", choose your Calendar</li>
                 <li>Set permissions to <span className="font-semibold">"Can view all details"</span></li>
                 <li>Click <span className="font-semibold">Publish</span></li>
-                <li>Copy the <span className="font-semibold">ICS</span> link (not the HTML link), paste above</li>
+                <li>Copy the <span className="font-semibold">ICS</span> link, paste above</li>
               </ol>
               <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-[11px] text-amber-900">
-                <strong>Privacy note:</strong> anyone with this URL can read your calendar. Don't share it. You can unpublish anytime via the same Outlook settings.
+                <strong>Privacy note:</strong> anyone with this URL can read your calendar. Don't share it.
               </div>
             </details>
             <div className="flex gap-2 justify-end">
@@ -646,9 +670,7 @@
               <button onClick={() => setView('done')} className={'px-4 py-1.5 text-sm font-medium rounded-md transition-all ' + (view === 'done' ? 'bg-sky-500 text-white shadow-sm' : 'text-slate-600 hover:text-slate-900')}>Done</button>
             </div>
 
-            {view === 'done' && (
-              <div className="mb-4"><input type="text" placeholder="Search completed tasks..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full px-3 py-2.5 text-sm bg-white border border-slate-200 rounded-lg outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100 transition-all shadow-sm" /></div>
-            )}
+            {view === 'done' && <div className="mb-4"><input type="text" placeholder="Search completed tasks..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full px-3 py-2.5 text-sm bg-white border border-slate-200 rounded-lg outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100 transition-all shadow-sm" /></div>}
 
             <div className="flex flex-col gap-1.5 min-h-[200px]">
               {filtered.length === 0 ? (
