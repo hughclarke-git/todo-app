@@ -1,5 +1,4 @@
-// Bump CACHE_NAME version when shipping updates
-const CACHE_NAME = 'todo-v1.1.0';
+const CACHE_NAME = 'todo-v1.2.0';
 const FILES = [
   './',
   './index.html',
@@ -21,7 +20,6 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Listen for skip waiting message from the page
 self.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
@@ -29,7 +27,6 @@ self.addEventListener('message', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // Network first for HTML so updates are picked up fast, fall back to cache offline
   if (event.request.mode === 'navigate') {
     event.respondWith(
       fetch(event.request).catch(() => caches.match('./index.html'))
