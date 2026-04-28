@@ -24,7 +24,7 @@
   <script type="text/babel" data-presets="react">
     const { useState, useEffect, useRef, useCallback } = React;
 
-    const APP_VERSION = '1.4.0';
+    const APP_VERSION = '1.4.1';
     const STORAGE_KEY = 'tasks-list-v1';
     const SETTINGS_KEY = 'app-settings-v1';
     const CALENDAR_CACHE_KEY = 'calendar-cache-v1';
@@ -32,8 +32,6 @@
 
     const CALENDAR_PROXY = 'https://todoapp.hugh-clarke.workers.dev/';
 
-    // Invalidate the calendar cache if the app version has changed
-    // (because parser changes can make cached times stale/wrong)
     (function checkVersionAndInvalidate() {
       try {
         const lastVersion = localStorage.getItem(VERSION_KEY);
@@ -162,31 +160,109 @@
       return (s || '').replace(/\\n/gi, '\n').replace(/\\,/g, ',').replace(/\\;/g, ';').replace(/\\\\/g, '\\');
     }
 
-    // Map common Microsoft Windows timezone names to IANA equivalents.
-    // Outlook sometimes uses these instead of standard IANA names.
+    // Comprehensive Windows timezone -> IANA mapping
+    // Based on Unicode CLDR windowsZones.xml (most common entries)
     const WINDOWS_TZ_MAP = {
+      // UTC and GMT
+      'UTC': 'UTC',
+      'UTC-11': 'Pacific/Pago_Pago',
+      'UTC-09': 'Etc/GMT+9',
+      'UTC-08': 'Etc/GMT+8',
+      'UTC-02': 'Etc/GMT+2',
+      'UTC+12': 'Etc/GMT-12',
+      'UTC+13': 'Etc/GMT-13',
       'GMT Standard Time': 'Europe/London',
       'Greenwich Standard Time': 'Atlantic/Reykjavik',
-      'Romance Standard Time': 'Europe/Paris',
+
+      // Europe
       'W. Europe Standard Time': 'Europe/Berlin',
+      'Romance Standard Time': 'Europe/Paris',
       'Central European Standard Time': 'Europe/Warsaw',
       'Central Europe Standard Time': 'Europe/Budapest',
       'E. Europe Standard Time': 'Europe/Bucharest',
       'FLE Standard Time': 'Europe/Helsinki',
       'GTB Standard Time': 'Europe/Athens',
-      'Eastern Standard Time': 'America/New_York',
-      'Central Standard Time': 'America/Chicago',
-      'Mountain Standard Time': 'America/Denver',
+      'Belarus Standard Time': 'Europe/Minsk',
+      'Russian Standard Time': 'Europe/Moscow',
+      'Russia Time Zone 3': 'Europe/Samara',
+      'Turkey Standard Time': 'Europe/Istanbul',
+
+      // Americas
+      'Hawaiian Standard Time': 'Pacific/Honolulu',
+      'Alaskan Standard Time': 'America/Anchorage',
       'Pacific Standard Time': 'America/Los_Angeles',
-      'UTC': 'UTC',
-      'Customized Time Zone': 'Europe/London', // Best-effort default for UK users
+      'Pacific Standard Time (Mexico)': 'America/Tijuana',
+      'Mountain Standard Time': 'America/Denver',
+      'Mountain Standard Time (Mexico)': 'America/Chihuahua',
+      'US Mountain Standard Time': 'America/Phoenix',
+      'Central Standard Time': 'America/Chicago',
+      'Central Standard Time (Mexico)': 'America/Mexico_City',
+      'Canada Central Standard Time': 'America/Regina',
+      'Eastern Standard Time': 'America/New_York',
+      'Eastern Standard Time (Mexico)': 'America/Cancun',
+      'US Eastern Standard Time': 'America/Indianapolis',
+      'Atlantic Standard Time': 'America/Halifax',
+      'Newfoundland Standard Time': 'America/St_Johns',
+      'SA Pacific Standard Time': 'America/Bogota',
+      'SA Western Standard Time': 'America/La_Paz',
+      'Pacific SA Standard Time': 'America/Santiago',
+      'E. South America Standard Time': 'America/Sao_Paulo',
+      'Argentina Standard Time': 'America/Buenos_Aires',
+
+      // Asia
+      'Iran Standard Time': 'Asia/Tehran',
+      'Arabian Standard Time': 'Asia/Dubai',
+      'Arabic Standard Time': 'Asia/Baghdad',
+      'Israel Standard Time': 'Asia/Jerusalem',
+      'Jordan Standard Time': 'Asia/Amman',
+      'Arab Standard Time': 'Asia/Riyadh',
+      'Afghanistan Standard Time': 'Asia/Kabul',
+      'West Asia Standard Time': 'Asia/Tashkent',
+      'Pakistan Standard Time': 'Asia/Karachi',
+      'India Standard Time': 'Asia/Kolkata',
+      'Sri Lanka Standard Time': 'Asia/Colombo',
+      'Nepal Standard Time': 'Asia/Kathmandu',
+      'Central Asia Standard Time': 'Asia/Almaty',
+      'Bangladesh Standard Time': 'Asia/Dhaka',
+      'Myanmar Standard Time': 'Asia/Rangoon',
+      'SE Asia Standard Time': 'Asia/Bangkok',
+      'North Asia Standard Time': 'Asia/Krasnoyarsk',
+      'China Standard Time': 'Asia/Shanghai',
+      'Singapore Standard Time': 'Asia/Singapore',
+      'Taipei Standard Time': 'Asia/Taipei',
+      'W. Australia Standard Time': 'Australia/Perth',
+      'Korea Standard Time': 'Asia/Seoul',
+      'Tokyo Standard Time': 'Asia/Tokyo',
+      'AUS Eastern Standard Time': 'Australia/Sydney',
+      'New Zealand Standard Time': 'Pacific/Auckland',
+
+      // Africa
+      'South Africa Standard Time': 'Africa/Johannesburg',
+      'Egypt Standard Time': 'Africa/Cairo',
+      'E. Africa Standard Time': 'Africa/Nairobi',
+      'Morocco Standard Time': 'Africa/Casablanca',
+
+      // Catch-all
+      'Customized Time Zone': 'UTC',
     };
 
     function normaliseTimezoneName(tzid) {
       if (!tzid) return null;
-      // Strip surrounding quotes which Outlook sometimes adds
-      const cleaned = tzid.replace(/^["']|["']$/g, '');
-      return WINDOWS_TZ_MAP[cleaned] || cleaned;
+      const cleaned = tzid.replace(/^["']|["']$/g, '').trim();
+      // First check the Windows map
+      if (WINDOWS_TZ_MAP[cleaned]) return WINDOWS_TZ_MAP[cleaned];
+      // Otherwise assume it's already IANA (Europe/London, Asia/Kolkata, etc.)
+      return cleaned;
+    }
+
+    // Validate that the browser actually recognises a timezone before using it
+    function isValidTimezone(tzid) {
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: tzid }).format(new Date());
+        return true;
+      } catch (e) {
+        return false;
+      }
     }
 
     function getTimezoneOffsetMinutes(tzid, utcDate) {
@@ -226,15 +302,18 @@
 
       if (params && params.TZID) {
         const tzid = normaliseTimezoneName(params.TZID);
-        const naiveUTC = Date.UTC(yN, mN, dN, hN, miN, sN);
-        const offsetMinutes = getTimezoneOffsetMinutes(tzid, new Date(naiveUTC));
-        if (offsetMinutes !== null) {
-          return new Date(naiveUTC - offsetMinutes * 60000);
+        if (isValidTimezone(tzid)) {
+          const naiveUTC = Date.UTC(yN, mN, dN, hN, miN, sN);
+          const offsetMinutes = getTimezoneOffsetMinutes(tzid, new Date(naiveUTC));
+          if (offsetMinutes !== null) {
+            return new Date(naiveUTC - offsetMinutes * 60000);
+          }
+        } else {
+          console.warn('Unknown timezone:', params.TZID, '-> using UTC fallback');
         }
       }
 
-      // No timezone info: Outlook published feeds typically default to UTC for floating times.
-      // We treat as UTC rather than local to match Outlook's actual behaviour.
+      // Floating time fallback: treat as UTC (Outlook published feeds tend to use UTC for naive times)
       return new Date(Date.UTC(yN, mN, dN, hN, miN, sN));
     }
 
@@ -602,7 +681,7 @@
       const [tasks, setTasks] = useState(() => loadTasks());
       const [settings, setSettings] = useState(() => loadSettings());
       const [showSettings, setShowSettings] = useState(false);
-      const [view, setView] = useState('active'); // active | done | today | unscheduled
+      const [view, setView] = useState('active');
       const [contextFilter, setContextFilter] = useState('all');
       const [searchQuery, setSearchQuery] = useState('');
       const [expandedId, setExpandedId] = useState(null);
@@ -669,7 +748,6 @@
         return { label: due.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), className: 'text-slate-500', urgency: 'later' };
       };
 
-      // Apply view filters
       let filtered = tasks;
       if (view === 'active') filtered = filtered.filter(t => !t.done);
       else if (view === 'done') filtered = filtered.filter(t => t.done);
