@@ -24,7 +24,7 @@
   <script type="text/babel" data-presets="react">
     const { useState, useEffect, useRef, useCallback } = React;
 
-    const APP_VERSION = '1.5.0';
+    const APP_VERSION = '1.7.0';
     const STORAGE_KEY = 'tasks-list-v1';
     const SETTINGS_KEY = 'app-settings-v1';
     const CALENDAR_CACHE_KEY = 'calendar-cache-v1';
@@ -342,6 +342,12 @@
       if (!dateStr) return false;
       const todayStr = new Date().toISOString().slice(0, 10);
       return dateStr < todayStr;
+    }
+
+    function isUpcoming(dateStr) {
+      if (!dateStr) return false;
+      const todayStr = new Date().toISOString().slice(0, 10);
+      return dateStr > todayStr;
     }
 
     function normaliseFeedUrl(url) {
@@ -667,6 +673,8 @@
       const [blockingTaskId, setBlockingTaskId] = useState(null);
       const [quickInput, setQuickInput] = useState('');
       const [quickContext, setQuickContext] = useState('work');
+      const [quickDueDate, setQuickDueDate] = useState('');
+      const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
       const quickInputRef = useRef(null);
 
       useEffect(() => { saveTasks(tasks); }, [tasks]);
@@ -677,12 +685,15 @@
         const newId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
         const newTask = {
           id: newId,
-          title: title.trim(), done: false, notes: '', dueDate: '', colorTag: 'none',
+          title: title.trim(), done: false, notes: '', dueDate: quickDueDate || '', colorTag: 'none',
           priority: 'none', context: quickContext, recurrence: { type: 'none', interval: 1 },
+          blocked: false, blockedReason: '',
           createdAt: Date.now(), completedAt: null,
         };
         setTasks([newTask, ...tasks]);
         setQuickInput('');
+        setQuickDueDate('');
+        setShowCustomDatePicker(false);
         // Auto-expand the new task so optional fields are immediately accessible
         setExpandedId(newId);
       };
@@ -725,9 +736,9 @@
         const diff = Math.round((due - today) / (1000 * 60 * 60 * 24));
         if (diff < 0) return { label: Math.abs(diff) + 'd overdue', className: 'text-rose-600 font-medium', urgency: 'overdue' };
         if (diff === 0) return { label: 'Today', className: 'text-sky-700 font-semibold', urgency: 'today' };
-        if (diff === 1) return { label: 'Tomorrow', className: 'text-sky-600', urgency: 'soon' };
-        if (diff < 7) return { label: 'in ' + diff + 'd', className: 'text-slate-600', urgency: 'soon' };
-        return { label: due.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), className: 'text-slate-500', urgency: 'later' };
+        if (diff === 1) return { label: 'Tomorrow', className: 'inline-flex items-center px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 border border-sky-200 text-[11px] font-medium', urgency: 'future' };
+        if (diff < 7) return { label: 'in ' + diff + 'd', className: 'inline-flex items-center px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 border border-sky-200 text-[11px] font-medium', urgency: 'future' };
+        return { label: due.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), className: 'inline-flex items-center px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 border border-sky-200 text-[11px] font-medium', urgency: 'future' };
       };
 
       let filtered = tasks;
@@ -736,6 +747,9 @@
       else if (view === 'today') filtered = filtered.filter(t => !t.done && isToday(t.dueDate));
       else if (view === 'overdue') filtered = filtered.filter(t => !t.done && isOverdue(t.dueDate));
       else if (view === 'unscheduled') filtered = filtered.filter(t => !t.done && !t.dueDate);
+      else if (view === 'upcoming') filtered = filtered.filter(t => !t.done && isUpcoming(t.dueDate));
+      else if (view === 'recurring') filtered = filtered.filter(t => !t.done && t.recurrence && t.recurrence.type && t.recurrence.type !== 'none');
+      else if (view === 'blocked') filtered = filtered.filter(t => !t.done && t.blocked);
 
       if (contextFilter !== 'all') filtered = filtered.filter(t => t.context === contextFilter);
       if (view === 'done' && searchQuery.trim()) {
@@ -743,7 +757,22 @@
         filtered = filtered.filter(t => t.title.toLowerCase().includes(q) || (t.notes && t.notes.toLowerCase().includes(q)));
       }
 
+      const dateBucket = (t) => {
+        if (!t.dueDate) return 2; // undated
+        if (isOverdue(t.dueDate)) return 0; // overdue first
+        if (isToday(t.dueDate)) return 1; // today next
+        return 3; // future-dated last
+      };
+
       const sortByPriorityAndDate = (a, b) => {
+        // In Active view, group by date bucket first so future-dated tasks sit at the bottom
+        if (view === 'active') {
+          const bDiff = dateBucket(a) - dateBucket(b);
+          if (bDiff !== 0) return bDiff;
+          // Within future-dated bucket, sort chronologically (soonest first), ignore priority
+          if (dateBucket(a) === 3) return a.dueDate.localeCompare(b.dueDate);
+        }
+        // For other buckets and other views, fall back to priority then date
         const pDiff = (PRIORITY_RANK[b.priority] || 0) - (PRIORITY_RANK[a.priority] || 0);
         if (pDiff !== 0) return pDiff;
         if (a.dueDate && !b.dueDate) return -1;
@@ -752,7 +781,12 @@
         return b.createdAt - a.createdAt;
       };
 
-      if (view !== 'done') {
+      // Upcoming view: always chronological by date, soonest first
+      const sortUpcoming = (a, b) => a.dueDate.localeCompare(b.dueDate);
+
+      if (view === 'upcoming') {
+        filtered = [...filtered].sort(sortUpcoming);
+      } else if (view !== 'done') {
         filtered = [...filtered].sort(sortByPriorityAndDate);
       } else {
         filtered = [...filtered].sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
@@ -765,16 +799,26 @@
       const todayCount = tasks.filter(t => !t.done && isToday(t.dueDate) && matchesContext(t)).length;
       const overdueCount = tasks.filter(t => !t.done && isOverdue(t.dueDate) && matchesContext(t)).length;
       const unscheduledCount = tasks.filter(t => !t.done && !t.dueDate && matchesContext(t)).length;
+      const upcomingCount = tasks.filter(t => !t.done && isUpcoming(t.dueDate) && matchesContext(t)).length;
+      const recurringCount = tasks.filter(t => !t.done && t.recurrence && t.recurrence.type && t.recurrence.type !== 'none' && matchesContext(t)).length;
+      const blockedCount = tasks.filter(t => !t.done && t.blocked && matchesContext(t)).length;
 
-      const ViewTab = ({ id, label, count, accent }) => (
-        <button
-          onClick={() => { setView(id); setSearchQuery(''); }}
-          className={'px-3 py-1.5 text-sm font-medium rounded-md transition-all flex items-center gap-1.5 ' + (view === id ? (accent === 'rose' ? 'bg-rose-500 text-white shadow-sm' : 'bg-sky-500 text-white shadow-sm') : 'text-slate-600 hover:text-slate-900')}
-        >
-          {label}
-          {count !== undefined && count > 0 && <span className={'text-[10px] px-1.5 py-0.5 rounded-full ' + (view === id ? 'bg-white/30 text-white' : (accent === 'rose' ? 'bg-rose-100 text-rose-700' : 'bg-slate-200 text-slate-600'))}>{count}</span>}
-        </button>
-      );
+      const ViewTab = ({ id, label, count, accent }) => {
+        const activeBg = accent === 'rose' ? 'bg-rose-500 text-white shadow-sm'
+          : accent === 'slate' ? 'bg-slate-600 text-white shadow-sm'
+          : 'bg-sky-500 text-white shadow-sm';
+        const inactivePill = accent === 'rose' ? 'bg-rose-100 text-rose-700'
+          : 'bg-slate-200 text-slate-600';
+        return (
+          <button
+            onClick={() => { setView(id); setSearchQuery(''); }}
+            className={'px-3 py-1.5 text-sm font-medium rounded-md transition-all flex items-center gap-1.5 ' + (view === id ? activeBg : 'text-slate-600 hover:text-slate-900')}
+          >
+            {label}
+            {count !== undefined && count > 0 && <span className={'text-[10px] px-1.5 py-0.5 rounded-full ' + (view === id ? 'bg-white/30 text-white' : inactivePill)}>{count}</span>}
+          </button>
+        );
+      };
 
       return (
         <div className="min-h-screen bg-gradient-to-br from-slate-50 via-sky-50 to-blue-50 py-8 px-4">
@@ -800,6 +844,27 @@
                 <span className="text-slate-500">Adding to:</span>
                 {CONTEXTS.map(c => <button key={c.id} onClick={() => setQuickContext(c.id)} className={'px-2.5 py-1 rounded-md font-medium transition-all flex items-center gap-1.5 ' + (quickContext === c.id ? 'bg-white border border-slate-300 text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700')}><span className={'w-1.5 h-1.5 rounded-full ' + c.dot}></span>{c.label}</button>)}
               </div>
+              <div className="flex gap-1.5 items-center text-xs mt-1.5 flex-wrap">
+                <span className="text-slate-500">Due:</span>
+                {(() => {
+                  const todayStr = new Date().toISOString().slice(0, 10);
+                  const tomorrowStr = (() => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().slice(0, 10); })();
+                  const isPickedNone = !quickDueDate;
+                  const isPickedToday = quickDueDate === todayStr;
+                  const isPickedTomorrow = quickDueDate === tomorrowStr;
+                  const isPickedOther = quickDueDate && !isPickedToday && !isPickedTomorrow;
+                  const pillClass = (active) => 'px-2.5 py-1 rounded-md font-medium transition-all flex items-center gap-1.5 ' + (active ? 'bg-white border border-slate-300 text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700');
+                  return (
+                    <>
+                      <button onClick={() => { setQuickDueDate(''); setShowCustomDatePicker(false); }} className={pillClass(isPickedNone)}>None</button>
+                      <button onClick={() => { setQuickDueDate(todayStr); setShowCustomDatePicker(false); }} className={pillClass(isPickedToday)}>Today</button>
+                      <button onClick={() => { setQuickDueDate(tomorrowStr); setShowCustomDatePicker(false); }} className={pillClass(isPickedTomorrow)}>Tomorrow</button>
+                      <button onClick={() => setShowCustomDatePicker(!showCustomDatePicker)} className={pillClass(isPickedOther || showCustomDatePicker)}>{isPickedOther ? new Date(quickDueDate + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'Pick date'}</button>
+                      {showCustomDatePicker && <input type="date" value={quickDueDate} onChange={(e) => setQuickDueDate(e.target.value)} className="px-2 py-1 text-xs border border-slate-200 rounded-md bg-white text-slate-900 outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-200" />}
+                    </>
+                  );
+                })()}
+              </div>
             </div>
 
             <div className="flex gap-2 items-center mb-3 flex-wrap">
@@ -816,7 +881,10 @@
               <ViewTab id="active" label="Active" />
               <ViewTab id="today" label="Today" count={todayCount} />
               <ViewTab id="overdue" label="Overdue" count={overdueCount} accent="rose" />
+              <ViewTab id="upcoming" label="Upcoming" count={upcomingCount} />
               <ViewTab id="unscheduled" label="Unscheduled" count={unscheduledCount} />
+              <ViewTab id="recurring" label="Recurring" count={recurringCount} />
+              <ViewTab id="blocked" label="Blocked" count={blockedCount} accent="slate" />
               <ViewTab id="done" label="Done" />
             </div>
 
@@ -829,6 +897,9 @@
                    view === 'today' ? 'Nothing due today. Take a breath.' :
                    view === 'overdue' ? 'Nothing overdue. Nice work staying on top of it.' :
                    view === 'unscheduled' ? 'Everything has a due date. Nice work.' :
+                   view === 'upcoming' ? 'Nothing coming up. Calendar is clear.' :
+                   view === 'recurring' ? 'No recurring tasks set up.' :
+                   view === 'blocked' ? 'Nothing blocked right now.' :
                    searchQuery ? 'No matches.' : 'No completed tasks yet.'}
                 </div>
               ) : filtered.map(task => {
@@ -843,14 +914,24 @@
                 const recurrenceLabel = describeRecurrence(task.recurrence);
                 const isRecurring = recurrenceLabel !== null;
                 const isBlocking = blockingTaskId === task.id;
+                const isBlocked = !!task.blocked;
 
                 let leftBorderClass = 'border-l-transparent';
-                if (due?.urgency === 'overdue') leftBorderClass = 'border-l-rose-500';
+                if (isBlocked) leftBorderClass = 'border-l-slate-400';
+                else if (due?.urgency === 'overdue') leftBorderClass = 'border-l-rose-500';
                 else if (due?.urgency === 'today') leftBorderClass = 'border-l-sky-500';
+                else if (due?.urgency === 'future') leftBorderClass = 'border-l-sky-200';
                 else if (hasColor) leftBorderClass = colorTag.border;
 
+                // Mute future-dated rows in the Active view so they recede behind today/overdue/undated.
+                // Mute blocked rows everywhere so they read as "paused, not actionable".
+                const isFuture = due?.urgency === 'future';
+                let muteClass = 'bg-white';
+                if (isBlocked) muteClass = 'opacity-75 bg-slate-50';
+                else if (view === 'active' && isFuture) muteClass = 'opacity-70 bg-slate-50/60';
+
                 return (
-                  <div key={task.id} className={'flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-all bg-white border border-slate-200 border-l-4 ' + leftBorderClass + ' shadow-sm hover:shadow-md ' + (isExpanded ? 'shadow-md ring-2 ring-sky-100' : '')} onClick={(e) => { if (e.target.closest('.checkbox-area') || e.target.closest('.details-area')) return; setExpandedId(isExpanded ? null : task.id); }}>
+                  <div key={task.id} className={'flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-all ' + muteClass + ' border border-slate-200 border-l-4 ' + leftBorderClass + ' shadow-sm hover:shadow-md ' + (isExpanded ? 'shadow-md ring-2 ring-sky-100' : '')} onClick={(e) => { if (e.target.closest('.checkbox-area') || e.target.closest('.details-area')) return; setExpandedId(isExpanded ? null : task.id); }}>
                     <div className="checkbox-area pt-0.5" onClick={(e) => { e.stopPropagation(); toggleTask(task.id); }}>
                       <div className={'w-[18px] h-[18px] border-[1.5px] rounded flex items-center justify-center transition-all ' + (task.done ? 'bg-sky-500 border-sky-500' : 'bg-white border-slate-300 hover:border-sky-500')}>
                         {task.done && <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="3"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>}
@@ -861,6 +942,7 @@
                         {hasPriority && <span className={'text-xs leading-snug pt-0.5 ' + priority.color} title={priority.label + ' priority'}>{priority.icon}</span>}
                         <div className={'text-[15px] leading-snug break-words flex-1 ' + (task.done ? 'text-slate-400 line-through' : 'text-slate-900')}>{task.title}</div>
                         <div className="flex items-center gap-1.5 flex-shrink-0">
+                          {isBlocked && <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-slate-200 text-slate-700 rounded text-[10px] font-medium border border-slate-300" title={task.blockedReason ? 'Blocked by: ' + task.blockedReason : 'Blocked'}>Blocked</span>}
                           {isRecurring && <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-teal-50 text-teal-700 rounded text-[10px] font-medium border border-teal-200" title={recurrenceLabel}><RepeatIcon className="w-3 h-3" /></span>}
                           {hasNotes && <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-50 text-amber-700 rounded text-[10px] font-medium border border-amber-200" title="Has notes"><NoteIcon className="w-3 h-3" />Notes</span>}
                         </div>
@@ -869,6 +951,7 @@
                         <span className={'flex items-center gap-1 ' + ctx.textColor}><span className={'w-1.5 h-1.5 rounded-full ' + ctx.dot}></span>{ctx.label}</span>
                         {due && <span className={due.className}>{due.label}</span>}
                         {hasColor && <span className={'w-2 h-2 rounded-full ' + colorTag.dot}></span>}
+                        {isBlocked && task.blockedReason && <span className="text-slate-500 italic">Blocked by: {task.blockedReason}</span>}
                       </div>
                       {!isExpanded && !task.done && (
                         <div className="mt-2" onClick={(e) => e.stopPropagation()}>
@@ -903,6 +986,16 @@
                               <div className="flex gap-1 flex-wrap">{RECURRENCE_PRESETS.map(r => <button key={r.id} onClick={() => updateTask(task.id, { recurrence: { ...task.recurrence, type: r.id } })} className={'px-2.5 py-1 text-xs rounded-md font-medium transition-all flex items-center gap-1 border ' + (task.recurrence?.type === r.id ? 'bg-teal-50 border-teal-300 text-teal-800' : 'bg-white border-slate-200 text-slate-500 hover:border-slate-400')}>{r.id !== 'none' && <RepeatIcon className="w-3 h-3" />}{r.label}</button>)}</div>
                               {task.recurrence?.type === 'custom' && (<div className="flex items-center gap-2 text-xs text-slate-600"><span>Every</span><input type="number" min="1" max="365" value={task.recurrence?.interval || 1} onChange={(e) => updateTask(task.id, { recurrence: { type: 'custom', interval: Math.max(1, parseInt(e.target.value) || 1) } })} className="w-16 px-2 py-1 border border-slate-200 rounded-md bg-white text-slate-900 outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-200" /><span>day{(task.recurrence?.interval || 1) > 1 ? 's' : ''}</span></div>)}
                               {task.recurrence?.type !== 'none' && <div className="text-[11px] text-slate-500 italic">When ticked, a new copy will appear with the next due date.</div>}
+                            </div>
+                          </div>
+                          <div className="flex gap-3 items-start mb-3 flex-wrap">
+                            <label className="text-xs text-slate-600 min-w-[60px] pt-1">Blocked</label>
+                            <div className="flex flex-col gap-2 flex-1 min-w-[200px]">
+                              <button onClick={() => updateTask(task.id, { blocked: !task.blocked })} className={'self-start px-2.5 py-1 text-xs rounded-md font-medium transition-all flex items-center gap-1.5 border ' + (task.blocked ? 'bg-slate-200 border-slate-400 text-slate-800' : 'bg-white border-slate-200 text-slate-500 hover:border-slate-400')}>
+                                <span className={'w-1.5 h-1.5 rounded-full ' + (task.blocked ? 'bg-slate-600' : 'bg-slate-300')}></span>
+                                {task.blocked ? 'Blocked' : 'Mark as blocked'}
+                              </button>
+                              {task.blocked && <input type="text" placeholder="Blocked by... (e.g. waiting on IT, pending approval)" value={task.blockedReason || ''} onChange={(e) => updateTask(task.id, { blockedReason: e.target.value })} className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded-md bg-white text-slate-900 outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-200" />}
                             </div>
                           </div>
                           <div className="flex gap-3 items-center mb-3 flex-wrap">
